@@ -1,6 +1,8 @@
 """Read-only access to cached data. Every other layer gets its data through these getters."""
 from __future__ import annotations
 
+import gzip
+import json
 import os
 from datetime import date, timedelta
 from functools import lru_cache
@@ -105,3 +107,73 @@ def get_pitcher_workload(pitcher_id: int, before: date, days: int = 14,
 def get_game_pitches(game_pk: int) -> pd.DataFrame:
     """Every pitch of one game in order. Feeds the eval harness replay."""
     return _run(f"SELECT * FROM pitches WHERE game_pk = ? ORDER BY {PITCH_ORDER}", [game_pk])
+
+
+MLB_CACHE = DATA_ROOT / "mlb"
+PLAYERS_PATH = MLB_CACHE / "players.parquet"
+
+
+def teams_path(season: int) -> Path:
+    return MLB_CACHE / "teams" / f"teams_{season}.parquet"
+
+
+def schedule_path(season: int) -> Path:
+    return MLB_CACHE / "schedules" / f"schedule_{season}.parquet"
+
+
+def roster_path(team_id: int, season: int, on_date: date | None = None) -> Path:
+    label = on_date.isoformat() if on_date else "full"
+    return MLB_CACHE / "rosters" / str(season) / f"team_{team_id}_{label}.parquet"
+
+
+def feed_path(game_pk: int) -> Path:
+    return MLB_CACHE / "feeds" / f"{game_pk}.json.gz"
+
+
+def _read_cached(path: Path, order_by: str) -> pd.DataFrame:
+    """Read one cached parquet table, or explain which pull is missing."""
+    if not path.exists():
+        raise FileNotFoundError(f"{path} is not cached. Run: python -m data.mlb_api season <year>")
+    return _run(f"SELECT * FROM read_parquet(?) ORDER BY {order_by}", [path.as_posix()])
+
+
+def get_teams(season: int) -> pd.DataFrame:
+    """All 30 teams with IDs and abbreviations."""
+    return _read_cached(teams_path(season), "team_id")
+
+
+def get_schedule(season: int, *, played_only: bool = True, before: date | None = None,
+                 game_types: tuple[str, ...] = ALL_MLB_GAMES) -> pd.DataFrame:
+    """One row per unique game. Feeds the eval harness game list."""
+    games = _read_cached(schedule_path(season), "official_date, game_pk")
+    games = games[games["game_type"].isin(game_types)]
+    if played_only:
+        games = games[games["played"]]
+    if before is not None:
+        games = games[games["official_date"] < pd.Timestamp(before)]
+    return games.reset_index(drop=True)
+
+
+def get_roster(team_id: int, season: int, on_date: date | None = None) -> pd.DataFrame:
+    """A team's full-season roster, or its active roster on one date if it was pulled."""
+    return _read_cached(roster_path(team_id, season, on_date), "player_id")
+
+
+def get_players() -> pd.DataFrame:
+    """Names, positions, and handedness for every cached player."""
+    return _read_cached(PLAYERS_PATH, "player_id")
+
+
+def get_game_feed(game_pk: int) -> dict:
+    """The full cached play-by-play feed for one game."""
+    path = feed_path(game_pk)
+    if not path.exists():
+        raise FileNotFoundError(f"{path} is not cached. Run: python -m data.mlb_api feed {game_pk}")
+    with gzip.open(path, "rt", encoding="utf-8") as file:
+        return json.load(file)
+
+
+def get_statcast_player_ids() -> list[int]:
+    """Every pitcher and batter ID in the Statcast cache."""
+    ids = _run("SELECT pitcher AS player_id FROM pitches UNION SELECT batter FROM pitches", [])
+    return sorted(ids["player_id"].astype(int).tolist())
